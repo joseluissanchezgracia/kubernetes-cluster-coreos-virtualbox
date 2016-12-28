@@ -1,0 +1,487 @@
+#!/bin/bash
+
+DEFAULT_ETCD_DISCOVERY="https://discovery.etcd.io/TOKEN"
+DEFAULT_ETCD_ADDR="http://192.168.15.4:2379"
+DEFAULT_ETCD_PEER_URLS="http://192.168.15.4:2380"
+DEFAULT_ETCD_LISTEN_PEER_URLS="http://0.0.0.0:2380"
+DEFAULT_ETCD_LISTEN_CLIENT_URLS="http://0.0.0.0:2379,http://0.0.0.0:4001"
+DEFAULT_K8S_VERSION="v1.5.1_coreos.0"
+DEFAULT_ADVERTISE_IP="192.168.15.4"
+DEFAULT_ETCD_ENDPOINTS="http://192.168.15.4:2379,http://192.168.15.5:2379,http://192.168.15.6:2379"
+DEFAULT_DNS_SERVICE_IP="10.3.0.10"
+DEFAULT_SERVICE_IP_RANGE="10.3.0.0/24"
+DEFAULT_POD_NETWORK="10.2.0.0/16"
+DEFAULT_HOST_DNS="10.108.22.20"
+DEFAULT_NETWORK_GATEWAY="192.168.15.1"
+
+USAGE="Usage: $0 -H HOSTNAME -S SSH_FILE [-p /target/path] [-d|-e|-i|-n|-t|-h|-v|-a|-c|-s|-r|-w|-o|-g]
+Options:
+    -d URL             Full URL path to discovery endpoint.
+    -e http://IP:PORT  Adviertise URL for client communication.
+    -H HOSTNAME        Machine hostname.
+    -i http://IP:PORT  URL for server communication.
+    -l http://IP:PORT  Listen URL for client communication.
+    -u http://IP:PORT  Listen URL for server communication.
+    -n NAME            etcd node name.
+    -p DEST            Create config-drive ISO image to the given path.
+    -S FILE            SSH keys file.
+    -t TOKEN           Token ID from https://discovery.etcd.io.
+	-v K8S_VERSION     This will map to: quay.io/coreos/hyperkube:${K8S_VER} release, e.g. v1.5.1_coreos.0
+	-a ADVERTISE_IP    This machine publicly routable IP
+	-c ETCD_ENDPOINTS  Comma separated list of ETCD node ips
+	-s DNS_SERVICE_IP  The VIP (Virtual IP) address of the cluster DNS service
+	-r SERVICE_IP_RANGE The CIDR network to use for service cluster VIPs (Virtual IPs)
+	-w POD_NETWORK	   The CIDR network to use for pod IPs
+	-o HOST_DNS        The DNS of the host in order to be used by the Virtual Box network adapter
+	-g NETWORK_GATEWAY The default network gateway to be used by the Virtual Box network adapter
+    -h                 This help
+
+This tool creates a kubernetes master node config-drive ISO image
+"
+
+CLOUD_CONFIG="#cloud-config
+
+write_files:
+  - path: /etc/kubernetes/cni/docker_opts_cni.env
+    permissions: 0644
+    content: |
+        DOCKER_OPT_BIP=\"\"
+        DOCKER_OPT_IPMASQ=\"\"
+  - path: /etc/kubernetes/cni/net.d/10-flannel.conf
+    permissions: 0644
+    content: |
+        {
+           \"name\": \"podnet\",
+           \"type\": \"flannel\",
+           \"delegate\": {
+             \"isDefaultGateway\": true
+           }
+        }
+  - path: /etc/kubernetes/manifests/kube-apiserver.yaml
+    permissions: 0644
+    content: |
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: kube-apiserver
+          namespace: kube-system
+        spec:
+          hostNetwork: true
+          containers:
+          - name: kube-apiserver
+            image: quay.io/coreos/hyperkube:<K8S_VERSION>
+            command:
+            - /hyperkube
+            - apiserver
+            - --bind-address=0.0.0.0
+            - --etcd-servers=<ETCD_ENDPOINTS>
+            - --allow-privileged=true
+            - --service-cluster-ip-range=<DNS_SERVICE_IP>/24
+            - --secure-port=443
+            - --advertise-address=<ADVERTISE_IP>
+            - --admission-control=NamespaceLifecycle,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota
+            - --tls-cert-file=/etc/kubernetes/ssl/apiserver.pem
+            - --tls-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+            - --client-ca-file=/etc/kubernetes/ssl/ca.pem
+            - --service-account-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+            - --runtime-config=extensions/v1beta1/networkpolicies=true
+            - --anonymous-auth=false
+            livenessProbe:
+              httpGet:
+                host: 127.0.0.1
+                port: 8080
+                path: /healthz
+              initialDelaySeconds: 15
+              timeoutSeconds: 15
+            ports:
+            - containerPort: 443
+              hostPort: 443
+              name: https
+            - containerPort: 8080
+              hostPort: 8080
+              name: local
+            volumeMounts:
+            - mountPath: /etc/kubernetes/ssl
+              name: ssl-certs-kubernetes
+              readOnly: true
+            - mountPath: /etc/ssl/certs
+              name: ssl-certs-host
+              readOnly: true
+          volumes:
+          - hostPath:
+              path: /etc/kubernetes/ssl
+            name: ssl-certs-kubernetes
+          - hostPath:
+              path: /usr/share/ca-certificates
+            name: ssl-certs-host
+  - path: /etc/kubernetes/manifests/kube-proxy.yaml
+    permissions: 0644
+    content: |
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: kube-proxy
+         namespace: kube-system
+       spec:
+         hostNetwork: true
+         containers:
+         - name: kube-proxy
+           image: quay.io/coreos/hyperkube:<K8S_VERSION>
+           command:
+           - /hyperkube
+           - proxy
+           - --master=http://127.0.0.1:8080
+           securityContext:
+             privileged: true
+           volumeMounts:
+           - mountPath: /etc/ssl/certs
+             name: ssl-certs-host
+             readOnly: true
+         volumes:
+         - hostPath:
+             path: /usr/share/ca-certificates
+           name: ssl-certs-host
+  - path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    permissions: 0644
+    content: |
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: kube-controller-manager
+         namespace: kube-system
+       spec:
+         hostNetwork: true
+         containers:
+         - name: kube-controller-manager
+           image: quay.io/coreos/hyperkube:<K8S_VERSION>
+           command:
+           - /hyperkube
+           - controller-manager
+           - --master=http://127.0.0.1:8080
+           - --leader-elect=true
+           - --service-account-private-key-file=/etc/kubernetes/ssl/apiserver-key.pem
+           - --root-ca-file=/etc/kubernetes/ssl/ca.pem
+           resources:
+             requests:
+               cpu: 200m
+           livenessProbe:
+             httpGet:
+               host: 127.0.0.1
+               path: /healthz
+               port: 10252
+             initialDelaySeconds: 15
+             timeoutSeconds: 15
+           volumeMounts:
+           - mountPath: /etc/kubernetes/ssl
+             name: ssl-certs-kubernetes
+             readOnly: true
+           - mountPath: /etc/ssl/certs
+             name: ssl-certs-host
+             readOnly: true
+         hostNetwork: true
+         volumes:
+         - hostPath:
+             path: /etc/kubernetes/ssl
+           name: ssl-certs-kubernetes
+         - hostPath:
+             path: /usr/share/ca-certificates
+           name: ssl-certs-host
+  - path: /etc/kubernetes/manifests/kube-scheduler.yaml
+    permissions: 0644
+    content: |
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: kube-scheduler
+         namespace: kube-system
+       spec:
+         hostNetwork: true
+         containers:
+         - name: kube-scheduler
+           image: quay.io/coreos/hyperkube:<K8S_VERSION>
+           command:
+           - /hyperkube
+           - scheduler
+           - --master=http://127.0.0.1:8080
+           - --leader-elect=true
+           resources:
+             requests:
+               cpu: 100m
+           livenessProbe:
+             httpGet:
+               host: 127.0.0.1
+               path: /healthz
+               port: 10251
+             initialDelaySeconds: 15
+             timeoutSeconds: 15
+coreos:
+  etcd2:
+    name: <ETCD_NAME>
+    advertise-client-urls: <ETCD_ADDR>
+    initial-advertise-peer-urls: <ETCD_PEER_URLS>
+    discovery: <ETCD_DISCOVERY>
+    listen-peer-urls: <ETCD_LISTEN_PEER_URLS>
+    listen-client-urls: <ETCD_LISTEN_CLIENT_URLS>
+  flannel:
+    interface: <ADVERTISE_IP>
+    etcd_endpoints: <ETCD_ENDPOINTS>
+  units:
+    - name: etcd2.service
+      command: start
+    - name: 00-eth0.network
+      runtime: true
+      content: |
+        [Match]
+        Name=enp0s3
+        
+        [Network]
+        DNS=<HOST_DNS>
+        Address=<ADVERTISE_IP>/24
+        Gateway=<NETWORK_GATEWAY>
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 50-flannel.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+            After=etcd2.service
+            
+            [Service]
+            ExecStartPre=-/usr/bin/etcdctl mk /coreos.com/network/config '{\"Network\":\"<POD_NETWORK>\", \"Backend\": {\"Type\": \"vxlan\"}}'
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 51-docker-mirror.conf
+          content: |
+            [Unit]
+            Requires=flanneld.service
+            After=flanneld.service
+            Restart=Always
+    - name: kubelet.service
+      command: start
+      content: |
+        [Service]
+        Environment=KUBELET_VERSION=<K8S_VERSION>
+        Environment=\"RKT_OPTS=--uuid-file-save=/var/run/kubelet-pod.uuid \
+          --volume var-log,kind=host,source=/var/log \
+          --mount volume=var-log,target=/var/log \
+          --volume dns,kind=host,source=/etc/resolv.conf \
+          --mount volume=dns,target=/etc/resolv.conf\"
+        ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
+        ExecStartPre=/usr/bin/mkdir -p /var/log/containers
+        ExecStartPre=-/usr/bin/rkt rm --uuid-file=/var/run/kubelet-pod.uuid
+        ExecStart=/usr/lib/coreos/kubelet-wrapper \
+          --api-servers=http://127.0.0.1:8080 \
+          --register-schedulable=false \
+          --cni-conf-dir=/etc/kubernetes/cni/net.d \
+          --network-plugin=cni \
+          --container-runtime=docker \
+          --allow-privileged=true \
+          --pod-manifest-path=/etc/kubernetes/manifests \
+          --hostname-override=<ADVERTISE_IP> \
+          --cluster_dns=<DNS_SERVICE_IP> \
+          --cluster_domain=cluster.local
+        ExecStop=-/usr/bin/rkt stop --uuid-file=/var/run/kubelet-pod.uuid
+        Restart=always
+        RestartSec=10
+        
+        [Install]
+        WantedBy=multi-user.target
+ssh_authorized_keys:
+  - <SSH_KEY>
+hostname: <HOSTNAME>
+"
+REGEX_SSH_FILE="^ssh-(rsa|dss|ed25519) [-A-Za-z0-9+\/]+[=]{0,2} .+"
+
+while getopts "d:e:H:i:n:p:S:t:l:u:h:v:a:c:s:R:w:o:g" OPTION
+do
+    case $OPTION in
+        d) ETCD_DISCOVERY="$OPTARG" ;;
+        e) ETCD_ADDR="$OPTARG" ;;
+        H) HNAME="$OPTARG" ;;
+        i) ETCD_PEER_URLS="$OPTARG" ;;
+        n) ETCD_NAME="$OPTARG" ;;
+        p) DEST="$OPTARG" ;;
+        S) SSH_FILE="$OPTARG" ;;
+        t) TOKEN="$OPTARG" ;;
+        u) ETCD_LISTEN_PEER_URLS="$OPTARG" ;;
+        l) ETCD_LISTEN_CLIENT_URLS="$OPTARG" ;;
+		v) K8S_VERSION="$OPTARG" ;;
+		a) ADVERTISE_IP="$OPTARG" ;;
+		c) ETCD_ENDPOINTS="$OPTARG" ;;
+		s) DNS_SERVICE_IP="$OPTARG" ;;
+		r) SERVICE_IP_RANGE="$OPTARG" ;;
+		w) POD_NETWORK="$OPTARG" ;;
+		o) HOST_DNS="$OPTARG" ;;
+		g) NETWORK_GATEWAY="$OPTARG" ;;
+        h) echo "$USAGE"; exit;;
+        *) exit 1;;
+    esac
+done
+
+# root user forbidden
+if [ $(id -u) -eq 0 ]; then
+    echo "$0: This script should not be run as root." >&2
+    exit 1
+fi
+
+# mkisofs/genisoimage tool check
+if which mkisofs &>/dev/null; then
+    mkisofs=$(which mkisofs)
+elif which genisoimage &>/dev/null; then
+    mkisofs=$(which genisoimage)
+else 
+    echo "$0: mkisofs or genisoimage tool is required to create image." >&2
+    exit 1
+fi
+
+if [ -z "$HNAME" ]; then
+    echo "$0: The hostname parameter '-H' is required." >&2
+    exit 1
+fi
+
+if [ -z "$SSH_FILE" ]; then
+    echo "$0: The SSH filename parameter '-S' is required." >&2
+    exit 1
+fi
+
+if [[ ! -r "$SSH_FILE" ]]; then
+    echo "$0: The SSH file (${SSH_FILE}) was not found." >&2
+    exit 1
+fi
+
+if [ $(cat "$SSH_FILE" | wc -l) -eq 0 ]; then
+    echo "$0: The SSH file (${SSH_FILE}) is empty." >&2
+    exit 1
+fi
+
+if [ $(grep -v -E "$REGEX_SSH_FILE" "$SSH_FILE" | wc -l) -gt 0 ]; then
+    echo "$0: The SSH file (${SSH_FILE}) content is invalid." >&2
+    exit 1
+fi
+
+if [ -z "$DEST" ]; then
+    DEST=$PWD
+fi
+
+if [[ ! -d "$DEST" ]]; then
+    echo "$0: Target path (${DEST}) do not exists." >&2
+    exit 1
+fi
+
+if [ ! -z "$ETCD_DISCOVERY" ] && [ ! -z "$TOKEN" ]; then
+    echo "$0: You cannot specify both discovery token and discovery URL." >&2
+    exit 1
+fi
+
+if [ ! -z "$TOKEN" ]; then
+    ETCD_DISCOVERY="${DEFAULT_ETCD_DISCOVERY//TOKEN/$TOKEN}"
+fi
+
+if [ -z "$ETCD_DISCOVERY" ]; then
+    ETCD_DISCOVERY=$DEFAULT_ETCD_DISCOVERY
+fi
+
+if [ -z "$ETCD_NAME" ]; then
+    ETCD_NAME=$HNAME
+fi
+
+if [ -z "$ETCD_ADDR" ]; then
+    ETCD_ADDR=$DEFAULT_ETCD_ADDR
+fi
+
+if [ -z "$ETCD_PEER_URLS" ]; then
+    ETCD_PEER_URLS=$DEFAULT_ETCD_PEER_URLS
+fi
+
+if [ -z "$ETCD_LISTEN_PEER_URLS" ]; then
+    ETCD_LISTEN_PEER_URLS=$DEFAULT_ETCD_LISTEN_PEER_URLS
+fi
+
+if [ -z "$ETCD_LISTEN_CLIENT_URLS" ]; then
+    ETCD_LISTEN_CLIENT_URLS=$DEFAULT_ETCD_LISTEN_CLIENT_URLS
+fi
+
+if [ -z "$K8S_VERSION" ]; then
+    K8S_VERSION=$DEFAULT_K8S_VERSION
+fi
+
+if [ -z "$ADVERTISE_IP" ]; then
+    ADVERTISE_IP=$DEFAULT_ADVERTISE_IP
+fi
+
+if [ -z "$ETCD_ENDPOINTS" ]; then
+    ETCD_ENDPOINTS=$DEFAULT_ETCD_ENDPOINTS
+fi
+
+if [ -z "$DNS_SERVICE_IP" ]; then
+    DNS_SERVICE_IP=$DEFAULT_DNS_SERVICE_IP
+fi
+
+if [ -z "$SERVICE_IP_RANGE" ]; then
+    SERVICE_IP_RANGE=$DEFAULT_SERVICE_IP_RANGE
+fi
+
+if [ -z "$POD_NETWORK" ]; then
+    POD_NETWORK=$DEFAULT_POD_NETWORK
+fi
+
+if [ -z "$HOST_DNS" ]; then
+    HOST_DNS=$DEFAULT_HOST_DNS
+fi
+
+if [ -z "$NETWORK_GATEWAY" ]; then
+    NETWORK_GATEWAY=$DEFAULT_NETWORK_GATEWAY
+fi
+
+WORKDIR="${DEST}/tmp.${RANDOM}"
+mkdir "$WORKDIR"
+trap "rm -rf '${WORKDIR}'" EXIT
+
+CONFIG_DIR="${WORKDIR}/openstack/latest"
+CONFIG_FILE="${CONFIG_DIR}/user_data"
+CONFIGDRIVE_FILE="${DEST}/${HNAME}.iso"
+
+mkdir -p "$CONFIG_DIR"
+
+while read l; do
+    if [ -z "$SSH_KEY" ]; then
+        SSH_KEY="$l"
+    else
+        SSH_KEY="$SSH_KEY
+  - $l"
+    fi
+done < "$SSH_FILE"
+
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_NAME>/${ETCD_NAME}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_DISCOVERY>/${ETCD_DISCOVERY}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_ADDR>/${ETCD_ADDR}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_PEER_URLS>/${ETCD_PEER_URLS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_LISTEN_PEER_URLS>/${ETCD_LISTEN_PEER_URLS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_LISTEN_CLIENT_URLS>/${ETCD_LISTEN_CLIENT_URLS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<SSH_KEY>/${SSH_KEY}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<HOSTNAME>/${HNAME}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<K8S_VERSION>/${K8S_VERSION}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ADVERTISE_IP>/${ADVERTISE_IP}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_ENDPOINTS>/${ETCD_ENDPOINTS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<DNS_SERVICE_IP>/${DNS_SERVICE_IP}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<SERVICE_IP_RANGE>/${SERVICE_IP_RANGE}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<POD_NETWORK>/${POD_NETWORK}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<HOST_DNS>/${HOST_DNS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<NETWORK_GATEWAY>/${NETWORK_GATEWAY}}"
+
+echo "$CLOUD_CONFIG" > "$CONFIG_FILE"
+
+$mkisofs -R -V config-2 -o "$CONFIGDRIVE_FILE" "$WORKDIR"
+
+if [ "$?" -eq 0 ] ; then
+    echo
+    echo
+    echo "Success! The config-drive image was created on ${CONFIGDRIVE_FILE}"
+else
+    echo
+    echo
+    echo "Failure! The config-drive image was not created on ${CONFIGDRIVE_FILE}"
+fi
+# vim: ts=4 et
