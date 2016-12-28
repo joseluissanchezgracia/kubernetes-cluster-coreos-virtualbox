@@ -36,7 +36,7 @@ Options:
 	-g NETWORK_GATEWAY The default network gateway to be used by the Virtual Box network adapter
     -h                 This help
 
-This tool creates a basic config-drive ISO image.
+This tool creates a kubernetes master node config-drive ISO image.
 "
 
 CLOUD_CONFIG="#cloud-config
