@@ -1,0 +1,309 @@
+#!/bin/bash
+
+DEFAULT_K8S_VERSION="v1.5.1_coreos.0"
+DEFAULT_ADVERTISE_IP="192.168.15.4"
+DEFAULT_ETCD_ENDPOINTS="http://192.168.15.4:2379,http://192.168.15.5:2379,http://192.168.15.6:2379"
+DEFAULT_DNS_SERVICE_IP="10.3.0.10"
+DEFAULT_HOST_DNS="10.108.22.20"
+DEFAULT_NETWORK_GATEWAY="192.168.15.1"
+DEFAULT_MASTER_HOST="https://192.168.15.100:443"
+
+USAGE="Usage: $0 -H HOSTNAME -S SSH_FILE [-p /target/path] [-h|-v|-a|-c|-s|-o|-g|-m]
+    -H HOSTNAME        Machine hostname.
+    -p DEST            Create config-drive ISO image to the given path.
+    -S FILE            SSH keys file.
+	-v K8S_VERSION     This will map to: quay.io/coreos/hyperkube:${K8S_VER} release, e.g. v1.5.1_coreos.0
+	-a ADVERTISE_IP    This machine publicly routable IP
+	-c ETCD_ENDPOINTS  Comma separated list of ETCD node ips
+	-s DNS_SERVICE_IP  The VIP (Virtual IP) address of the cluster DNS service
+	-o HOST_DNS        The DNS of the host in order to be used by the Virtual Box network adapter
+	-g NETWORK_GATEWAY The default network gateway to be used by the Virtual Box network adapter
+	-m MASTER_HOST     The default IP of the master host or master load balancer if using clustering
+    -h                 This help
+
+This tool creates a kubernetes worker node config-drive ISO image 
+"
+
+CLOUD_CONFIG="#cloud-config
+
+write_files:
+  - path: /etc/kubernetes/cni/docker_opts_cni.env
+    permissions: 0644
+    content: |
+        DOCKER_OPT_BIP=\"\"
+        DOCKER_OPT_IPMASQ=\"\"
+  - path: /etc/kubernetes/cni/net.d/10-flannel.conf
+    permissions: 0644
+    content: |
+        {
+           \"name\": \"podnet\",
+           \"type\": \"flannel\",
+           \"delegate\": {
+             \"isDefaultGateway\": true
+           }
+        }
+  - path: /etc/kubernetes/manifests/kube-proxy.yaml
+    permissions: 0644
+    content: |
+       apiVersion: v1
+       kind: Pod
+       metadata:
+         name: kube-proxy
+         namespace: kube-system
+       spec:
+         hostNetwork: true
+         containers:
+         - name: kube-proxy
+           image: quay.io/coreos/hyperkube:v1.5.1_coreos.0
+           command:
+           - /hyperkube
+           - proxy
+           - --master=<MASTER_HOST>
+           - --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml
+           securityContext:
+             privileged: true
+           volumeMounts:
+           - mountPath: /etc/ssl/certs
+             name: ssl-certs
+           - mountPath: /etc/kubernetes/worker-kubeconfig.yaml
+             name: kubeconfig
+             readOnly: true
+           - mountPath: /etc/kubernetes/ssl
+             name: etc-kube-ssl
+             readOnly: true
+         volumes:
+         - name: ssl-certs
+           hostPath:
+             path: /usr/share/ca-certificates
+         - name: kubeconfig
+           hostPath:
+             path: /etc/kubernetes/worker-kubeconfig.yaml
+         - name: etc-kube-ssl
+           hostPath:
+             path: /etc/kubernetes/ssl
+  - path: /etc/kubernetes/worker-kubeconfig.yaml
+    permissions: 0644
+    content: |
+       apiVersion: v1
+       kind: Config
+       clusters:
+       - name: local
+         cluster:
+           certificate-authority: /etc/kubernetes/ssl/ca.pem
+       users:
+       - name: kubelet
+         user:
+           client-certificate: /etc/kubernetes/ssl/worker.pem
+           client-key: /etc/kubernetes/ssl/worker-key.pem
+       contexts:
+       - context:
+           cluster: local
+           user: kubelet
+         name: kubelet-context
+       current-context: kubelet-context
+coreos:
+  flannel:
+    interface: <ADVERTISE_IP>
+    etcd_endpoints: <ETCD_ENDPOINTS>
+  units:
+    - name: 00-eth0.network
+      runtime: true
+      content: |
+        [Match]
+        Name=enp0s3
+        
+        [Network]
+        DNS=<HOST_DNS>
+        Address=<ADVERTISE_IP>/24
+        Gateway=<NETWORK_GATEWAY>
+    - name: flanneld.service
+      command: start
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 51-docker-mirror.conf
+          content: |
+            [Unit]
+            Requires=flanneld.service
+            After=flanneld.service
+            Restart=Always
+            [Service]
+            EnvironmentFile=/etc/kubernetes/cni/docker_opts_cni.env
+    - name: kubelet.service
+      command: start
+      content: |
+        [Service]
+        Environment=KUBELET_VERSION=<K8S_VERSION>
+        Environment=\"RKT_OPTS=--uuid-file-save=/var/run/kubelet-pod.uuid \
+          --volume dns,kind=host,source=/etc/resolv.conf \
+          --mount volume=dns,target=/etc/resolv.conf \
+          --volume var-log,kind=host,source=/var/log \
+          --mount volume=var-log,target=/var/log\"
+        ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
+        ExecStartPre=/usr/bin/mkdir -p /var/log/containers
+        ExecStartPre=-/usr/bin/rkt rm --uuid-file=/var/run/kubelet-pod.uuid
+        ExecStart=/usr/lib/coreos/kubelet-wrapper \
+          --api-servers=<MASTER_HOST> \
+          --cni-conf-dir=/etc/kubernetes/cni/net.d \
+          --network-plugin=cni \
+          --container-runtime=docker \
+          --register-node=true \
+          --allow-privileged=true \
+          --pod-manifest-path=/etc/kubernetes/manifests \
+          --hostname-override=<ADVERTISE_IP> \
+          --cluster_dns=<DNS_SERVICE_IP> \
+          --cluster_domain=cluster.local \
+          --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
+          --tls-cert-file=/etc/kubernetes/ssl/worker.pem \
+          --tls-private-key-file=/etc/kubernetes/ssl/worker-key.pem
+        ExecStop=-/usr/bin/rkt stop --uuid-file=/var/run/kubelet-pod.uuid
+        Restart=always
+        RestartSec=10
+        
+        [Install]
+        WantedBy=multi-user.target
+ssh_authorized_keys:
+  - <SSH_KEY>
+hostname: <HOSTNAME>
+"
+REGEX_SSH_FILE="^ssh-(rsa|dss|ed25519) [-A-Za-z0-9+\/]+[=]{0,2} .+"
+
+while getopts "H:p:S:h:v:a:c:s:o:g:m" OPTION
+do
+    case $OPTION in
+        H) HNAME="$OPTARG" ;;
+        p) DEST="$OPTARG" ;;
+        S) SSH_FILE="$OPTARG" ;;
+		v) K8S_VERSION="$OPTARG" ;;
+		a) ADVERTISE_IP="$OPTARG" ;;
+		c) ETCD_ENDPOINTS="$OPTARG" ;;
+		s) DNS_SERVICE_IP="$OPTARG" ;;
+		o) HOST_DNS="$OPTARG" ;;
+		g) NETWORK_GATEWAY="$OPTARG" ;;
+		m) MASTER_HOST="$OPTARG" ;;
+        h) echo "$USAGE"; exit;;
+        *) exit 1;;
+    esac
+done
+
+# root user forbidden
+if [ $(id -u) -eq 0 ]; then
+    echo "$0: This script should not be run as root." >&2
+    exit 1
+fi
+
+# mkisofs/genisoimage tool check
+if which mkisofs &>/dev/null; then
+    mkisofs=$(which mkisofs)
+elif which genisoimage &>/dev/null; then
+    mkisofs=$(which genisoimage)
+else 
+    echo "$0: mkisofs or genisoimage tool is required to create image." >&2
+    exit 1
+fi
+
+if [ -z "$HNAME" ]; then
+    echo "$0: The hostname parameter '-H' is required." >&2
+    exit 1
+fi
+
+if [ -z "$SSH_FILE" ]; then
+    echo "$0: The SSH filename parameter '-S' is required." >&2
+    exit 1
+fi
+
+if [[ ! -r "$SSH_FILE" ]]; then
+    echo "$0: The SSH file (${SSH_FILE}) was not found." >&2
+    exit 1
+fi
+
+if [ $(cat "$SSH_FILE" | wc -l) -eq 0 ]; then
+    echo "$0: The SSH file (${SSH_FILE}) is empty." >&2
+    exit 1
+fi
+
+if [ $(grep -v -E "$REGEX_SSH_FILE" "$SSH_FILE" | wc -l) -gt 0 ]; then
+    echo "$0: The SSH file (${SSH_FILE}) content is invalid." >&2
+    exit 1
+fi
+
+if [ -z "$DEST" ]; then
+    DEST=$PWD
+fi
+
+if [[ ! -d "$DEST" ]]; then
+    echo "$0: Target path (${DEST}) do not exists." >&2
+    exit 1
+fi
+
+if [ -z "$K8S_VERSION" ]; then
+    K8S_VERSION=$DEFAULT_K8S_VERSION
+fi
+
+if [ -z "$ADVERTISE_IP" ]; then
+    ADVERTISE_IP=$DEFAULT_ADVERTISE_IP
+fi
+
+if [ -z "$ETCD_ENDPOINTS" ]; then
+    ETCD_ENDPOINTS=$DEFAULT_ETCD_ENDPOINTS
+fi
+
+if [ -z "$DNS_SERVICE_IP" ]; then
+    DNS_SERVICE_IP=$DEFAULT_DNS_SERVICE_IP
+fi
+
+if [ -z "$HOST_DNS" ]; then
+    HOST_DNS=$DEFAULT_HOST_DNS
+fi
+
+if [ -z "$NETWORK_GATEWAY" ]; then
+    NETWORK_GATEWAY=$DEFAULT_NETWORK_GATEWAY
+fi
+
+if [ -z "$MASTER_HOST" ]; then
+    MASTER_HOST=$DEFAULT_MASTER_HOST
+fi
+
+WORKDIR="${DEST}/tmp.${RANDOM}"
+mkdir "$WORKDIR"
+trap "rm -rf '${WORKDIR}'" EXIT
+
+CONFIG_DIR="${WORKDIR}/openstack/latest"
+CONFIG_FILE="${CONFIG_DIR}/user_data"
+CONFIGDRIVE_FILE="${DEST}/${HNAME}.iso"
+
+mkdir -p "$CONFIG_DIR"
+
+while read l; do
+    if [ -z "$SSH_KEY" ]; then
+        SSH_KEY="$l"
+    else
+        SSH_KEY="$SSH_KEY
+  - $l"
+    fi
+done < "$SSH_FILE"
+
+CLOUD_CONFIG="${CLOUD_CONFIG//<SSH_KEY>/${SSH_KEY}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<HOSTNAME>/${HNAME}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<K8S_VERSION>/${K8S_VERSION}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ADVERTISE_IP>/${ADVERTISE_IP}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<ETCD_ENDPOINTS>/${ETCD_ENDPOINTS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<DNS_SERVICE_IP>/${DNS_SERVICE_IP}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<HOST_DNS>/${HOST_DNS}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<NETWORK_GATEWAY>/${NETWORK_GATEWAY}}"
+CLOUD_CONFIG="${CLOUD_CONFIG//<MASTER_HOST>/${MASTER_HOST}}"
+
+echo "$CLOUD_CONFIG" > "$CONFIG_FILE"
+
+$mkisofs -R -V config-2 -o "$CONFIGDRIVE_FILE" "$WORKDIR"
+
+if [ "$?" -eq 0 ] ; then
+    echo
+    echo
+    echo "Success! The config-drive image was created on ${CONFIGDRIVE_FILE}"
+else
+    echo
+    echo
+    echo "Failure! The config-drive image was not created on ${CONFIGDRIVE_FILE}"
+fi
+# vim: ts=4 et
