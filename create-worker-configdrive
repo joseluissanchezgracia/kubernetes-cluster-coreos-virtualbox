@@ -89,6 +89,7 @@ write_files:
        clusters:
        - name: local
          cluster:
+           server: <MASTER_HOST>
            certificate-authority: /etc/kubernetes/ssl/ca.pem
        users:
        - name: kubelet
