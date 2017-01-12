@@ -169,7 +169,7 @@ hostname: <HOSTNAME>
 "
 REGEX_SSH_FILE="^ssh-(rsa|dss|ed25519) [-A-Za-z0-9+\/]+[=]{0,2} .+"
 
-while getopts "H:p:S:h:v:a:c:s:o:g:m" OPTION
+while getopts "H:p:S:h:v:a:c:s:o:g:m:" OPTION
 do
     case $OPTION in
         H) HNAME="$OPTARG" ;;
