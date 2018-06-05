@@ -1,2 +1,2 @@
 # kubernetes-cluster-coreos-virtualbox
-Kubernetes cluster for development purposes on coreos over virtualbox
+Full material for deployment of HA Kubernetes cluster v1.5 -development purposes- on coreos over virtualbox
